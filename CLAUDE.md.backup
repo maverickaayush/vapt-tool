@@ -2,22 +2,6 @@
 
 > **This file is auto-loaded by Claude Code at the start of every session in this repo.**
 > It is the single source of truth for the project: architecture, stack, schemas, file layout, and the exact build sequence to follow. Read this fully before generating any code.
->
-> **Fast lookup:** for run commands, folder responsibilities, and a "where do I make this change" cheat sheet, see [`docs/QUICK_REF.md`](docs/QUICK_REF.md) instead of re-deriving them from this full document. For workflow/process rules (when to avoid full-file rewrites, re-reading the repo, etc.), see [`docs/IGNORE.md`](docs/IGNORE.md).
-
----
-
-## ⚙️ Token-Efficient Workflow Rules
-
-These govern *how* to work in this repo — process, not project behavior:
-
-1. **Minimal responses while coding.** Don't narrate every step; report results, not a runtime commentary.
-2. **Avoid unnecessary explanations.** If the architecture or schema contract isn't in question, don't re-explain it — point to `docs/QUICK_REF.md`.
-3. **Prefer patch-based edits over full-file rewrites.** Use targeted edits for the specific function/section that needs to change, not a full regeneration of the file.
-4. **Do not reload or re-explain the full repository unless explicitly asked.** Once context is established in a session, don't re-read unchanged files "just to be sure."
-5. **Only load relevant modules for the task at hand.** A change scoped to `headers.py` doesn't need `owasp.py`, `ssl_tls.py`, or the full `CLAUDE.md` re-read.
-
-See [`docs/IGNORE.md`](docs/IGNORE.md) for the full list with rationale.
 
 ---
 
@@ -243,7 +227,7 @@ OWASP ZAP (headless daemon, primary) + Nikto (fast misconfig pattern-match, 6,70
 
 ZAP controlled via `python-owasp-zap-v2.4`: start daemon → wait for ready → spider + active scan → retrieve alerts as JSON → kill process. Total timeout: 5 minutes.
 
-> **Port isolation (native dev / local-daemon mode only):** ZAP binds to a port (default 8090). If two scans run concurrently, they will collide. Use a per-scan port derived from `scan_id`, e.g. `8090 + (hash(scan_id) % 900)`, and pass it as `-port {port}` to the daemon and to the `ZAPv2` proxies dict. **This only applies when `ZAP_URL` is unset.** In Docker (Step 9), ZAP runs as a shared sidecar container at a fixed port (`http://zap:8090`) and per-scan isolation instead comes from `zap.core.new_session(name=scan_id)` - see Section 7's ZAP sidecar deviation note for the full reasoning.
+> **Port isolation:** ZAP binds to a port (default 8090). If two scans run concurrently, they will collide. Use a per-scan port derived from `scan_id`, e.g. `8090 + (hash(scan_id) % 900)`, and pass it as `-port {port}` to the daemon and to the `ZAPv2` proxies dict.
 
 #### 4.3.3 SSL/TLS Module - `backend/tasks/ssl_tls.py`
 
@@ -329,11 +313,7 @@ num_ctx: 8192
 
 User message format: `f'Analyze these VAPT findings for {domain}: {json.dumps(aggregated)}'`
 
-**Error handling:** if Ollama times out (**240s** - see timing note below) or returns invalid JSON, fall back to a rule-based severity analysis built from the raw aggregated findings - never let the pipeline hard-fail here.
-
-> **Ollama timeout - raised from 120s to 240s (deliberate, empirically-measured deviation, decided during Step 9 Docker build):** a real `/api/chat` analysis call for a 23-finding scan was directly timed at **130.2s** on the reference hardware (RTX 4060 Laptop, 8GB VRAM, qwen2.5:7b Q4_K_M) - already past the originally-specified 120s, so real scans were routinely hitting the rule-based fallback instead of genuine AI analysis. 240s gives headroom for run-to-run variance and larger finding sets, while staying well short of leaving a scan hanging. Same category of decision as the nmap two-phase scan and webscan per-task limit tuning above - measured against real hardware, not guessed.
->
-> **Downstream consequence:** `aggregate_and_analyse` (the Celery chord callback in `scan_orchestrator.py` that calls Ollama) also needed its per-task limit raised from the global 300s/360s default to **`soft_time_limit=360, time_limit=420`** - the default 300s soft limit left only ~50-60s of margin over a 240s Ollama call plus aggregation and PDF generation, too tight given GPU/network variance. Same pattern as recon (600s/660s) and webscan (480s/540s): the stage doing genuinely variable-duration work gets a deliberately generous, documented ceiling rather than the tight default.
+**Error handling:** if Ollama times out (120s) or returns invalid JSON, fall back to a rule-based severity analysis built from the raw aggregated findings - never let the pipeline hard-fail here.
 
 ### 4.6 Report Generation - `backend/reports/generator.py`
 
@@ -438,7 +418,7 @@ Single-page app, communicates exclusively with the FastAPI backend.
 
 ## 7. Docker Compose Architecture
 
-**As actually built (Step 9, verified end-to-end with a real scan + real Ollama analysis):** six services - PostgreSQL, Redis, **OWASP ZAP** (sidecar container, not Ollama), FastAPI backend, Celery worker, Next.js frontend (standalone Node server, not Nginx). Ollama runs **natively on the host**, not in Docker - see the deviation note immediately below before assuming the original spec.
+Six services: PostgreSQL, Redis, Ollama (GPU passthrough), FastAPI backend, Celery worker, React frontend (via Nginx).
 
 ```yaml
 services:
@@ -446,55 +426,41 @@ services:
     image: postgres:16-alpine
   redis:
     image: redis:7-alpine
-  zap:
-    image: zaproxy/zap-stable:latest   # sidecar, not bundled into backend
+  ollama:
+    image: ollama/ollama       # GPU passthrough enabled
   backend:
-    build:
-      context: .                       # repo ROOT, not ./backend - see note
-      dockerfile: backend/Dockerfile
+    build: ./backend           # FastAPI image
   worker:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile    # same image as backend, different command
+    build: ./backend           # same image, different entrypoint
     command: celery -A tasks.celery_app worker --loglevel=info -c 5
   frontend:
-    build:
-      context: ./frontend
-      args:
-        NEXT_INTERNAL_API_URL: http://backend:8000   # build ARG, not just env - see note
+    build: ./frontend          # Next.js + Nginx (standalone output)
 ```
 
-> **Ollama runs natively on the host, not in Docker - deliberate architecture deviation from this section's original GPU-passthrough-in-Docker design (decided & built during Step 9):** the reference machine already has Ollama installed as a systemd service with `qwen2.5:7b` pulled and GPU passthrough working bare-metal: simpler than configuring `nvidia-container-toolkit` for an equivalent containerized setup. Containers reach it via `host.docker.internal` (mapped through `extra_hosts: ["host.docker.internal:host-gateway"]` on `backend`/`worker`) at `OLLAMA_URL=http://host.docker.internal:11434`.
->
-> **Required host-level change, confirmed with the user before applying (security-relevant - widens Ollama's network exposure):** Ollama's default bind is `127.0.0.1:11434` - loopback only, unreachable from Docker's bridge network even via `host.docker.internal` (verified: `connect ECONNREFUSED` against the bridge gateway IP). Fixed via systemd override:
-> ```bash
-> sudo systemctl edit ollama
-> # add under [Service]:
-> #   Environment="OLLAMA_HOST=0.0.0.0:11434"
-> sudo systemctl daemon-reload && sudo systemctl restart ollama
-> ```
-> This makes Ollama reachable from the local network, not just Docker - acceptable on a personal/dev workstation, worth a firewall rule (block 11434 from non-Docker sources) on a shared machine. `ollama_data` volume from the original spec is kept in `docker-compose.yml` but unused while Ollama stays native - reserved for a future fully-containerized migration.
+Ollama GPU access:
+```yaml
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: 1
+          capabilities: [gpu]
+```
 
-> **ZAP runs as a separate sidecar container, not started as a local daemon inside backend (deviation from Section 4.3.2's local-daemon assumption, required because two different runtime contexts now share the same `webscan.py`):** `backend/config.py` has a `ZAP_URL` setting (empty string = native dev, falls back to the original per-scan-port local-daemon spawn/kill behavior in `_run_zap()`). When `ZAP_URL` is set (Docker: `http://zap:8090`), `_run_zap()` skips the local process entirely and instead calls `zap.core.new_session(name=scan_id)` for per-scan isolation - replacing the port-hash isolation scheme, which doesn't apply to a daemon shared across concurrent scans. The spider/active-scan/alert-retrieval logic in the middle of `_run_zap()` is unchanged in both branches; it only talks to the `zap` client object regardless of where the daemon lives.
+Per-service detail (used in Step 9 below):
+1. **postgres** - `postgres:16-alpine`, env `POSTGRES_DB=vapt POSTGRES_USER=vapt POSTGRES_PASSWORD=vapt_secure_2025`, volume `postgres_data`, healthcheck `pg_isready`
+2. **redis** - `redis:7-alpine`, healthcheck `redis-cli ping`
+3. **ollama** - `ollama/ollama:latest`, volume `ollama_data:/root/.ollama`, GPU reservation as above; post-start step should auto-pull `qwen2.5:7b` if not already present
+4. **backend** - build `./backend`, depends on postgres/redis/ollama, env `DATABASE_URL REDIS_URL OLLAMA_URL`, ports `8000:8000`, command `uvicorn main:app --host 0.0.0.0 --port 8000 --reload`, volume `./backend:/app`
+5. **worker** - same image as backend, depends on postgres/redis, command `celery -A tasks.celery_app worker --loglevel=info -c 5`
+6. **frontend** - build `./frontend`, ports `3000:80`, depends on backend; Dockerfile uses `node:20-alpine` build stage + `nginx:alpine` serve stage
 
-> **backend Dockerfile - real package/build issues found and fixed, not assumed (all verified by actually building the image, not by reading the original spec):**
-> - **Base image pinned to `python:3.11-slim-bookworm`, not bare `python:3.11-slim`.** The unpinned tag currently resolves to Debian "trixie" (testing), where `nikto` isn't in apt's repos at all (confirmed: neither trixie nor bookworm has it - it's Ubuntu-`universe`-only). Pinning to bookworm (Debian 12 stable) is necessary regardless, since nikto is installed from source either way (next point) - the pin is for everything else `apt-get install`s, which needs a stable, known-good repo state.
-> - **`nikto` installed from GitHub source** (`git clone https://github.com/sullo/nikto.git`, symlinked to `/usr/local/bin/nikto`), same pattern as `testssl.sh`. Requires `libjson-perl` and `libxml-writer-perl` from apt (verified missing via `nikto -Version` erroring on both modules) - `webscan.py` calls nikto with `-Format json`, so `libjson-perl` specifically is load-bearing, not optional.
-> - **`libpango-1.0-0` + `libpangoft2-1.0-0` required from apt** for WeasyPrint's PDF rendering. The `weasyprint` pip package only ships Python bindings - without these system libs, `import weasyprint` fails with `OSError: cannot load library 'libgobject-2.0-0'` (this pulls in libcairo/libgobject transitively).
-> - **`psutil` added to `requirements.txt`.** Used in `webscan.py` for ZAP process lifecycle management; was installed natively during Step 4 testing but never added to the pinned dependency list - a real omission, not a Docker-specific need.
-> - **Build context is the repo root (`context: .`), not `./backend`.** `alembic.ini` and `migrations/` live at the repo root as siblings of `backend/` (per `migrations/env.py`'s `sys.path.insert(..., '..', 'backend')` logic) - a build context scoped to `./backend` alone can never see them. The image mirrors the exact native layout (`/app/backend/`, `/app/migrations/`, `/app/alembic.ini`) so `env.py`'s relative path resolution works identically in both contexts, with zero code changes to `env.py`'s path logic itself. A root-level `.dockerignore` excludes `frontend/`, `.git/`, and other irrelevant content from this wider context.
-> - **`migrations/env.py` overrides `alembic.ini`'s static `sqlalchemy.url`** with `settings.DATABASE_URL` (env-driven) right after `config = context.config`. The ini's hardcoded `localhost` URL would never resolve to the `postgres` Docker service - this bug only surfaces once you actually run `alembic upgrade head` against a containerized Postgres, which the original spec never exercised.
-> - **The initial Alembic migration was hand-written**, not autogenerated. `migrations/versions/` was completely empty going into Step 9 - no native PostgreSQL was available earlier in the build to run `alembic revision --autogenerate` against. The migration (`scans` + `reports` tables, `scanstatus` enum) was written directly from `models.py`. One real bug caught while writing it: calling `scan_status.create(op.get_bind(), checkfirst=True)` explicitly *and* using the same enum object as a column type in `create_table()` double-creates the type (`create_table`'s `before_create` DDL event auto-creates it too) - raises `DuplicateObject`. Fix: don't call `.create()` explicitly; let the column's automatic creation handle it once.
->
-> **`whois` is required** - `backend/tasks/recon.py` shells out to the `whois` binary (bounded subprocess); without it WHOIS recon is skipped (logged, non-fatal).
+**backend/Dockerfile:** `FROM python:3.11-slim`, install system packages (`nmap nikto sslscan whois curl wget`), install `testssl.sh` from GitHub to `/usr/local/bin/testssl.sh`, install the `subfinder` binary, `COPY requirements.txt`, `WORKDIR /app`. **`whois` is required** - `backend/tasks/recon.py` shells out to the `whois` binary (bounded subprocess); without it WHOIS recon is skipped (logged, non-fatal).
 
-> **frontend - Next.js standalone server, no Nginx; the proxy URL must be a build ARG, not a runtime env var (real bug, not a guess):** `next.config.mjs`'s `rewrites()` is evaluated **once at `next build` time** and baked into `.next/standalone`'s `routes-manifest.json` - it is *not* re-evaluated per-request at container runtime, even with `output: 'standalone'`. A runtime-only `environment: NEXT_INTERNAL_API_URL: http://backend:8000` in `docker-compose.yml` was silently ignored: the manifest had `destination: "http://localhost:8000/api/:path*"` baked in from whatever the var was at `docker build` time (unset, since build-time and runtime env vars are different mechanisms) - confirmed via `connect ECONNREFUSED ::1:8000` / `127.0.0.1:8000` in the frontend container's logs despite the runtime env var being correctly set. Fix: pass it as a Docker build `ARG` (with a sensible default matching the compose service name, `http://backend:8000`) so it's present while `npm run build` actually executes `rewrites()`.
+**.env.example:** `DATABASE_URL`, `REDIS_URL`, `OLLAMA_URL`, `SECRET_KEY`, `ALLOWED_HOSTS`
 
-> **subfinder API keys reach the container via a repo-relative file, not a direct host-path bind mount.** A bind mount straight to `~/.config/subfinder/provider-config.yaml` is unsafe if that file doesn't exist on whoever's machine runs `docker compose up`: Docker silently creates an empty *directory* there and mounts that in, which breaks subfinder (expects a file) instead of degrading gracefully. Instead: `backend/subfinder-config/provider-config.yaml.example` is committed (empty/template, explains how to add free GitHub/Chaos keys); `backend/subfinder-config/provider-config.yaml` (the real file, with actual keys for local use) is gitignored *and* excluded from the Docker build context via `.dockerignore`, so keys never enter git history or get baked into the image - they reach the container only via the runtime bind mount `./backend/subfinder-config/provider-config.yaml:/root/.config/subfinder/provider-config.yaml:ro`. First-time setup copies the `.example` to the real filename (alongside `cp .env.example .env`), guaranteeing the mount source always exists.
-
-**.env.example:** `POSTGRES_PASSWORD`, `SECRET_KEY`, `ALLOWED_HOSTS`, `OLLAMA_URL=http://host.docker.internal:11434` (not `DATABASE_URL`/`REDIS_URL` directly - those are assembled from `POSTGRES_PASSWORD` inside `docker-compose.yml`'s `environment:` blocks using the Docker service names).
-
-**README.md:** quick-start - `cp .env.example .env` + `cp backend/subfinder-config/provider-config.yaml.example backend/subfinder-config/provider-config.yaml` → `docker compose up -d` → wait ~2 min for the ZAP healthcheck → open `localhost:3000`. Notes that Ollama must be installed and the model pulled on the host *first* (it isn't part of the compose stack). Includes the authorized-use-only legal disclaimer.
+**README.md:** quick-start - `git clone` → copy `.env.example` → `docker-compose up` → open `localhost:3000`. Note that the first run pulls Qwen 2.5 7B (~4.5 GB). Include the authorized-use-only legal disclaimer.
 
 ---
 
@@ -735,17 +701,12 @@ Error handling: Ollama timeout (120s) or invalid JSON → fall back to a rule-ba
 - **pages/Report.jsx** - fetch `/api/scan/{id}/findings` on mount; summary cards (Critical red, High orange, Medium yellow, Low blue); Recharts BarChart by severity; sortable VulnTable (Severity badge, Title, CVSS, OWASP Category, Module, Priority); click row to expand evidence/CVE/remediation; "Download PDF" button hitting `/api/scan/{id}/report`
 - **components/SeverityBadge.jsx** - colored pill: Critical=red, High=orange, Medium=yellow, Low=blue, Info=gray
 
-### STEP 9 - Docker Compose & Final Setup (complete, verified end-to-end with a real scan + real Ollama analysis)
+### STEP 9 - Docker Compose & Final Setup
 At project root, create:
-- **docker-compose.yml** - the 6 services as specified in Section 7 (postgres, redis, **zap**, backend, worker, frontend - **not** ollama; see Section 7's deviation notes for why) with healthchecks and dependencies
-- **backend/Dockerfile** - as specified in Section 7's deviation notes (bookworm pin, nikto from source, WeasyPrint system libs, repo-root build context, psutil dependency)
-- **frontend/Dockerfile** - multi-stage `node:20-alpine`, `npm ci` (this project's lockfile is `package-lock.json`, not `pnpm-lock.yaml`), `output: 'standalone'`, `NEXT_INTERNAL_API_URL` passed as a build ARG (see Section 7's note - this is load-bearing, not optional)
-- **backend/config.py** - add `ZAP_URL: str = ""` setting (Section 7's ZAP sidecar note)
-- **backend/tasks/webscan.py** - branch `_run_zap()` on `settings.ZAP_URL` (remote sidecar vs local daemon)
-- **migrations/versions/** - the hand-written initial migration (Section 7's note - autogenerate was never possible earlier in the build with no native Postgres available)
-- **.env.example** - `POSTGRES_PASSWORD`, `SECRET_KEY`, `ALLOWED_HOSTS`, `OLLAMA_URL=http://host.docker.internal:11434`
+- **docker-compose.yml** - the 6 services exactly as specified in Section 7 above (postgres, redis, ollama, backend, worker, frontend) with healthchecks and dependencies
+- **backend/Dockerfile** - as specified in Section 7
+- **.env.example** - `DATABASE_URL`, `REDIS_URL`, `OLLAMA_URL`, `SECRET_KEY`, `ALLOWED_HOSTS`
 - **README.md** - quick-start instructions + legal disclaimer, as specified in Section 7
-- Host-level (outside the repo, done once, requires the user's sudo): `OLLAMA_HOST=0.0.0.0:11434` via `systemctl edit ollama` - see Section 7's deviation note before assuming Ollama is reachable from containers by default
 
 ---
 
